@@ -12,10 +12,22 @@ METADATA_DIR="$XRAY_CONFIG_DIR/inbounds"
 SCRIPT_PATH="/usr/local/bin/xray-tool"
 
 # Client-side DPI countermeasures appended to generated VLESS links.
-# Happ / Xray-based clients understand these; other clients ignore unknown params.
 # Format: fragment=<length>,<interval>,<packets>[,maxSplit]
-# Set to "" to disable if it causes problems on your network.
-DPI_FRAGMENT="1-10,5-20,tlshello"
+# Disabled by default: ClientHello splitting in Happ/iOS breaks H2 sessions and
+# produces the "connects for a second, then goes silent" behaviour.
+# Set to e.g. "1-10,5-20,tlshello" only if the plain handshake is actually blocked.
+DPI_FRAGMENT=""
+
+# XHTTP hardening written into every new XHTTP inbound.
+# Padding randomises POST sizes; the sc* values mirror current Xray defaults but
+# are written explicitly so a core update cannot silently change them.
+# scStreamUpServerSecs makes the server push data every 20-80s, so NAT/DPI idle
+# timeouts never see a quiet connection.
+XHTTP_PADDING="100-1000"
+XHTTP_SC_MAX_EACH_POST_BYTES=1000000
+XHTTP_SC_MIN_POSTS_INTERVAL_MS=30
+XHTTP_SC_MAX_BUFFERED_POSTS=30
+XHTTP_SC_STREAM_UP_SERVER_SECS="20-80"
 
 # ----------------------------------------------
 # Helper functions
@@ -177,21 +189,23 @@ cmd_inbounds_add() {
 
     grpc_service=""
     xhttp_path=""
-    xhttp_mode="auto"
+    xhttp_mode="stream-one"
     if [ "$transport" = "grpc" ]; then
         read -p "gRPC serviceName (default: empty, press Enter): " grpc_service
     elif [ "$transport" = "xhttp" ]; then
         read -p "XHTTP path (default: /): " xhttp_path
         xhttp_path=${xhttp_path:-/}
         echo "XHTTP mode (affects only the client link; server accepts all modes):"
-        echo "1) auto       (default; with REALITY the client uses stream-one)"
-        echo "2) packet-up  (best compatibility, survives DPI/NAT drops best)"
-        echo "3) stream-up  (gRPC-masqueraded streaming)"
-        read -p "Choice [1-3] (default: 1): " xhttp_mode_choice
+        echo "1) stream-one (default; single H2 stream, required for REALITY)"
+        echo "2) packet-up  (separate POSTs, survives NAT drops on flaky links)"
+        echo "3) stream-up  (one long POST, server keepalive every 20-80s)"
+        echo "4) auto       (resolves to stream-one with REALITY, but old clients may fall back)"
+        read -p "Choice [1-4] (default: 1): " xhttp_mode_choice
         case $xhttp_mode_choice in
             2) xhttp_mode="packet-up";;
             3) xhttp_mode="stream-up";;
-            *) xhttp_mode="auto";;
+            4) xhttp_mode="auto";;
+            *) xhttp_mode="stream-one";;
         esac
     fi
 
@@ -240,7 +254,25 @@ cmd_inbounds_add() {
     if [ "$transport" = "grpc" ]; then
         stream_json=$(echo "$stream_json" | jq --arg svc "$grpc_service" '.grpcSettings = {"serviceName": $svc, "multiMode": false}')
     elif [ "$transport" = "xhttp" ]; then
-        stream_json=$(echo "$stream_json" | jq --arg path "$xhttp_path" '.xhttpSettings = {"path": $path}')
+        # Full XHTTP settings instead of just "path": padding hides request sizes,
+        # the sc* knobs keep the H2 session alive through NAT/DPI idle drops.
+        stream_json=$(echo "$stream_json" | jq \
+            --arg path "$xhttp_path" \
+            --arg mode "$xhttp_mode" \
+            --arg padding "$XHTTP_PADDING" \
+            --argjson maxEachPost "$XHTTP_SC_MAX_EACH_POST_BYTES" \
+            --argjson minPostsInterval "$XHTTP_SC_MIN_POSTS_INTERVAL_MS" \
+            --argjson maxBuffered "$XHTTP_SC_MAX_BUFFERED_POSTS" \
+            --arg streamUpSecs "$XHTTP_SC_STREAM_UP_SERVER_SECS" \
+            '.xhttpSettings = {
+                "path": $path,
+                "mode": $mode,
+                "xPaddingBytes": $padding,
+                "scMaxEachPostBytes": $maxEachPost,
+                "scMinPostsIntervalMs": $minPostsInterval,
+                "scMaxBufferedPosts": $maxBuffered,
+                "scStreamUpServerSecs": $streamUpSecs
+            }')
     fi
 
     # Build inbound with empty clients array
@@ -446,7 +478,7 @@ cmd_clients_qr() {
         return 1
     fi
     source "$info_file"
-    xhttpMode=${xhttpMode:-auto}
+    xhttpMode=${xhttpMode:-stream-one}
     xhttpPath=${xhttpPath:-/}
 
     client_flow=$(jq --argjson port "$port" --arg email "$email" -r \
