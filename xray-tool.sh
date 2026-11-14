@@ -11,6 +11,24 @@ XRAY_INSTALL_SCRIPT="https://github.com/XTLS/Xray-install/raw/main/install-relea
 METADATA_DIR="$XRAY_CONFIG_DIR/inbounds"
 SCRIPT_PATH="/usr/local/bin/xray-tool"
 
+# Client-side DPI countermeasures appended to generated VLESS links.
+# Format: fragment=<length>,<interval>,<packets>[,maxSplit]
+# Disabled by default: ClientHello splitting in Happ/iOS breaks H2 sessions and
+# produces the "connects for a second, then goes silent" behaviour.
+# Set to e.g. "1-10,5-20,tlshello" only if the plain handshake is actually blocked.
+DPI_FRAGMENT=""
+
+# XHTTP hardening written into every new XHTTP inbound.
+# Padding randomises POST sizes; the sc* values mirror current Xray defaults but
+# are written explicitly so a core update cannot silently change them.
+# scStreamUpServerSecs makes the server push data every 20-80s, so NAT/DPI idle
+# timeouts never see a quiet connection.
+XHTTP_PADDING="100-1000"
+XHTTP_SC_MAX_EACH_POST_BYTES=1000000
+XHTTP_SC_MIN_POSTS_INTERVAL_MS=30
+XHTTP_SC_MAX_BUFFERED_POSTS=30
+XHTTP_SC_STREAM_UP_SERVER_SECS="20-80"
+
 # ----------------------------------------------
 # Helper functions
 # ----------------------------------------------
@@ -52,8 +70,21 @@ cmd_install() {
         echo "Enabling BBR..."
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        sysctl -p
     fi
+
+    # Network stability tweaks: keep long-lived mobile tunnels alive through NAT/DPI
+    for kv in \
+        "net.ipv4.tcp_slow_start_after_idle=0" \
+        "net.ipv4.tcp_mtu_probing=1" \
+        "net.ipv4.tcp_keepalive_time=60" \
+        "net.ipv4.tcp_keepalive_intvl=20" \
+        "net.ipv4.tcp_keepalive_probes=5"; do
+        key="${kv%%=*}"
+        if ! grep -q "^${key}=" /etc/sysctl.conf 2>/dev/null; then
+            echo "$kv" >> /etc/sysctl.conf
+        fi
+    done
+    sysctl -p >/dev/null 2>&1 || true
 
     bash -c "$(curl -4 -L $XRAY_INSTALL_SCRIPT)" @ install
 
@@ -66,7 +97,7 @@ cmd_install() {
         { "protocol": "freedom", "tag": "direct" },
         { "protocol": "blackhole", "tag": "block" }
     ],
-    "policy": { "levels": { "0": { "handshake": 3, "connIdle": 180 } } }
+    "policy": { "levels": { "0": { "handshake": 10, "connIdle": 600 } } }
 }
 EOF
 
@@ -135,8 +166,8 @@ cmd_inbounds_add() {
         *) echo "Invalid choice"; return 1;;
     esac
 
-    read -p "Target domain (default: dl.google.com:443): " target
-    target=${target:-dl.google.com:443}
+    read -p "Target domain (default: www.apple.com:443): " target
+    target=${target:-www.apple.com:443}
     sni=$(echo "$target" | cut -d: -f1)
 
     echo "Select client fingerprint (TLS imitation):"
@@ -158,11 +189,24 @@ cmd_inbounds_add() {
 
     grpc_service=""
     xhttp_path=""
+    xhttp_mode="stream-one"
     if [ "$transport" = "grpc" ]; then
         read -p "gRPC serviceName (default: empty, press Enter): " grpc_service
     elif [ "$transport" = "xhttp" ]; then
         read -p "XHTTP path (default: /): " xhttp_path
         xhttp_path=${xhttp_path:-/}
+        echo "XHTTP mode (affects only the client link; server accepts all modes):"
+        echo "1) stream-one (default; single H2 stream, required for REALITY)"
+        echo "2) packet-up  (separate POSTs, survives NAT drops on flaky links)"
+        echo "3) stream-up  (one long POST, server keepalive every 20-80s)"
+        echo "4) auto       (resolves to stream-one with REALITY, but old clients may fall back)"
+        read -p "Choice [1-4] (default: 1): " xhttp_mode_choice
+        case $xhttp_mode_choice in
+            2) xhttp_mode="packet-up";;
+            3) xhttp_mode="stream-up";;
+            4) xhttp_mode="auto";;
+            *) xhttp_mode="stream-one";;
+        esac
     fi
 
     # --- FIXED KEY PARSING ---
@@ -199,13 +243,36 @@ cmd_inbounds_add() {
                 "serverNames": [$sni],
                 "privateKey": $privKey,
                 "shortIds": [$shortid]
+            },
+            "sockopt": {
+                "tcpKeepAliveIdle": 45,
+                "tcpKeepAliveInterval": 15,
+                "tcpUserTimeout": 10000
             }
         }')
 
     if [ "$transport" = "grpc" ]; then
         stream_json=$(echo "$stream_json" | jq --arg svc "$grpc_service" '.grpcSettings = {"serviceName": $svc, "multiMode": false}')
     elif [ "$transport" = "xhttp" ]; then
-        stream_json=$(echo "$stream_json" | jq --arg path "$xhttp_path" '.xhttpSettings = {"path": $path}')
+        # Full XHTTP settings instead of just "path": padding hides request sizes,
+        # the sc* knobs keep the H2 session alive through NAT/DPI idle drops.
+        stream_json=$(echo "$stream_json" | jq \
+            --arg path "$xhttp_path" \
+            --arg mode "$xhttp_mode" \
+            --arg padding "$XHTTP_PADDING" \
+            --argjson maxEachPost "$XHTTP_SC_MAX_EACH_POST_BYTES" \
+            --argjson minPostsInterval "$XHTTP_SC_MIN_POSTS_INTERVAL_MS" \
+            --argjson maxBuffered "$XHTTP_SC_MAX_BUFFERED_POSTS" \
+            --arg streamUpSecs "$XHTTP_SC_STREAM_UP_SERVER_SECS" \
+            '.xhttpSettings = {
+                "path": $path,
+                "mode": $mode,
+                "xPaddingBytes": $padding,
+                "scMaxEachPostBytes": $maxEachPost,
+                "scMinPostsIntervalMs": $minPostsInterval,
+                "scMaxBufferedPosts": $maxBuffered,
+                "scStreamUpServerSecs": $streamUpSecs
+            }')
     fi
 
     # Build inbound with empty clients array
@@ -242,6 +309,7 @@ publicKey=$publicKey
 shortId=$shortid
 grpcServiceName=$grpc_service
 xhttpPath=$xhttp_path
+xhttpMode=$xhttp_mode
 flow=$flow
 fingerprint=$fingerprint
 EOF
@@ -410,6 +478,8 @@ cmd_clients_qr() {
         return 1
     fi
     source "$info_file"
+    xhttpMode=${xhttpMode:-stream-one}
+    xhttpPath=${xhttpPath:-/}
 
     client_flow=$(jq --argjson port "$port" --arg email "$email" -r \
         '.inbounds[] | select(.port == $port) | .settings.clients[] | select(.email == $email) | .flow' "$XRAY_CONFIG_FILE")
@@ -421,15 +491,20 @@ cmd_clients_qr() {
         read -p "Server IP: " server_ip
     fi
 
+    dpi_params=""
+    if [ -n "$DPI_FRAGMENT" ]; then
+        dpi_params="&fragment=${DPI_FRAGMENT}"
+    fi
+
     case $type in
         tcp)
-            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=tcp&flow=${client_flow}&encryption=none#${email}"
+            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=tcp&flow=${client_flow}&encryption=none${dpi_params}#${email}"
             ;;
         grpc)
-            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=grpc&serviceName=${grpcServiceName}&encryption=none#${email}"
+            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=grpc&serviceName=${grpcServiceName}&alpn=h2&encryption=none${dpi_params}#${email}"
             ;;
         xhttp)
-            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=xhttp&path=${xhttpPath}&encryption=none#${email}"
+            link="vless://${uuid}@${server_ip}:${port}?security=reality&sni=${sni}&fp=${fingerprint}&pbk=${publicKey}&sid=${shortId}&type=xhttp&path=${xhttpPath}&mode=${xhttpMode}&alpn=h2&encryption=none${dpi_params}#${email}"
             ;;
         *)
             echo "Unknown transport type: $type"
